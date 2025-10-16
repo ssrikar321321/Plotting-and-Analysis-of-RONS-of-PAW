@@ -1,6 +1,20 @@
-streamlit>=1.28.0
-matplotlib==3.8.4
-numpy==1.26.4
-pandas==2.2.2
-specio
+# Core requirements for UV-Vis SPC Dashboard
+# These are the minimum required packages
 
+# Web framework
+streamlit>=1.28.0
+
+# Data processing
+numpy>=1.23.0
+pandas>=1.5.0
+
+# Plotting
+matplotlib>=3.6.0
+
+# Optional: For enhanced SPC file support (uncomment if needed)
+# specio>=0.2.0
+# spc-spectra>=0.3.0
+
+# Note: The dashboard includes a basic SPC reader that works without
+# the optional packages. Install specio or spc-spectra only if you
+# need advanced SPC file format support.
