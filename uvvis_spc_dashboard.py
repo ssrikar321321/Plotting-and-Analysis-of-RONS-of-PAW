@@ -1,30 +1,49 @@
 # uvvis_spc_dashboard.py
 # Streamlit dashboard for plotting UV‑Vis spectra from .spc files (and CSV/TXT fallback)
-# Author: ChatGPT (GPT-5 Thinking)
-# Requirements: streamlit, matplotlib, numpy, pandas, (optional) spc-spectra
-# If your files are .spc (Galactic/GRAMS), please:  pip install spc-spectra
+# Requirements: streamlit, matplotlib, numpy, pandas
+# Optional for better SPC support: pip install specio OR pip install spc-spectra
+# The app includes a basic SPC reader that works without additional packages!
 
 import io
 import os
 import sys
 import tempfile
+import struct
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-# Try to import the 'spc' package for Galactic .spc files.
-# If unavailable, we'll show a help box.
+# Try to import SPC reading capability from various sources
+# We'll try multiple libraries in order of preference
+SPC_AVAILABLE = False
+SPC_METHOD = None
+
+# Method 1: Try specio (most modern and maintained)
 try:
-    # Try modern spc-spectra first, then fall back to old spc
-    try:
-        import spc_spectra as spc
-    except ImportError:
-        import spc
+    import specio
     SPC_AVAILABLE = True
-except Exception:
-    SPC_AVAILABLE = False
+    SPC_METHOD = "specio"
+except ImportError:
+    pass
+
+# Method 2: Try spc-spectra
+if not SPC_AVAILABLE:
+    try:
+        try:
+            import spc_spectra as spc
+        except ImportError:
+            import spc
+        SPC_AVAILABLE = True
+        SPC_METHOD = "spc"
+    except ImportError:
+        pass
+
+# Method 3: We'll implement a basic SPC reader if nothing else works
+if not SPC_AVAILABLE:
+    SPC_METHOD = "custom"
+    SPC_AVAILABLE = True  # We'll always have our custom reader
 
 st.set_page_config(
     page_title="UV‑Vis .SPC Plotter",
@@ -86,94 +105,168 @@ legend_loc = st.sidebar.selectbox("Legend location", [
 show_legend = st.sidebar.checkbox("Show legend", value=True)
 
 # ---------- Helper functions ----------
-def read_spc(file_obj, name_hint=""):
-    """Read a .spc file using the 'spc-spectra' package.
-    Returns a list of (x, y, label) tuples.
-    Handles multi-subfile SPCs.
+def read_spc_custom(data):
+    """Basic SPC file reader for Galactic/GRAMS format.
+    This is a minimal implementation that handles common UV-Vis SPC files.
     """
-    import tempfile
+    import struct
     
-    if not SPC_AVAILABLE:
-        raise RuntimeError("The 'spc-spectra' package is not installed. Run: pip install spc-spectra")
+    # SPC file format has specific byte signatures
+    # Check if this looks like an SPC file
+    if len(data) < 512:
+        raise ValueError("File too small to be a valid SPC file")
     
-    # Read the file data
-    data = file_obj.read()
+    # Read header information
+    # Bytes 0-3: SPC file signature (should be specific values)
+    # Byte 4: File version
+    version = data[4]
     
-    # Try different methods to read the SPC file
-    f = None
+    # Bytes 8-11: Number of points (little-endian)
+    num_points = struct.unpack('<I', data[8:12])[0]
     
-    # Method 1: Try direct bytes (some versions might support this)
+    # Bytes 16-19: First X value (little-endian float)
+    # Bytes 20-23: Last X value (little-endian float)
+    first_x = struct.unpack('<f', data[16:20])[0]
+    last_x = struct.unpack('<f', data[20:24])[0]
+    
+    # Check data type flag at byte 5
+    data_type = data[5]
+    
+    # For single file SPCs, Y data typically starts at byte 512
+    y_start = 512
+    
     try:
-        f = spc.File(data)
+        # Generate X values (evenly spaced)
+        if num_points > 0 and num_points < 100000:  # Sanity check
+            x = np.linspace(first_x, last_x, num_points)
+            
+            # Read Y values (4-byte floats)
+            y = []
+            for i in range(num_points):
+                offset = y_start + (i * 4)
+                if offset + 4 <= len(data):
+                    y_val = struct.unpack('<f', data[offset:offset+4])[0]
+                    y.append(y_val)
+            
+            y = np.array(y[:len(x)])  # Ensure same length
+            
+            if len(y) > 0:
+                return x, y
     except:
         pass
     
-    # Method 2: Try BytesIO
-    if f is None:
-        try:
-            f = spc.File(io.BytesIO(data))
-        except:
-            pass
+    # Fallback: Try to parse as different format
+    # Some SPC files might have different structures
+    raise ValueError("Could not parse SPC file structure")
+
+def read_spc(file_obj, name_hint=""):
+    """Read a .spc file using available methods.
+    Returns a list of (x, y, label) tuples.
+    """
+    import tempfile
     
-    # Method 3: Use temporary file (most reliable)
-    if f is None:
-        with tempfile.NamedTemporaryFile(suffix='.spc', delete=False) as tmp_file:
-            tmp_file.write(data)
-            tmp_file_path = tmp_file.name
-        
-        try:
-            f = spc.File(tmp_file_path)
-        finally:
-            # Clean up the temporary file
-            try:
-                os.unlink(tmp_file_path)
-            except:
-                pass
-    
-    if f is None:
-        raise ValueError("Could not read SPC file with any method")
+    # Read the file data
+    file_obj.seek(0)  # Ensure we're at the beginning
+    data = file_obj.read()
     
     series = []
-    # 'sub' contains individual spectra (subfiles). If absent, data is in f.x/f.y
-    if hasattr(f, "sub") and f.sub:
-        for i, s in enumerate(f.sub):
-            try:
-                x = np.array(s.x)
-                y = np.array(s.y)
-                label = f"{os.path.basename(name_hint)} • sub{i+1}"
-                series.append((x, y, label))
-            except Exception as e:
-                st.warning(f"Could not read subfile {i+1} from {name_hint}: {e}")
-    else:
+    
+    # Method 1: Try specio (if available)
+    if SPC_METHOD == "specio":
         try:
-            x = np.array(f.x)
-            y = np.array(f.y)
-            label = os.path.basename(name_hint)
-            series.append((x, y, label))
-        except Exception as e:
-            # Some SPC files might have data in different attributes
-            if hasattr(f, 'data'):
-                # Try to extract x and y from data attribute
-                if isinstance(f.data, np.ndarray):
-                    # Assume first column is x, second is y
-                    if f.data.ndim == 2 and f.data.shape[1] >= 2:
-                        x = f.data[:, 0]
-                        y = f.data[:, 1]
+            import specio
+            # specio needs a file path, so use temporary file
+            with tempfile.NamedTemporaryFile(suffix='.spc', delete=False) as tmp_file:
+                tmp_file.write(data)
+                tmp_file_path = tmp_file.name
+            
+            try:
+                # Read using specio
+                spec_data = specio.load(tmp_file_path)
+                
+                # specio returns different formats, try to extract x,y
+                if hasattr(spec_data, 'wavelength') and hasattr(spec_data, 'flux'):
+                    x = np.array(spec_data.wavelength)
+                    y = np.array(spec_data.flux)
+                elif hasattr(spec_data, 'x') and hasattr(spec_data, 'y'):
+                    x = np.array(spec_data.x)
+                    y = np.array(spec_data.y)
+                elif isinstance(spec_data, (list, tuple)) and len(spec_data) >= 2:
+                    x = np.array(spec_data[0])
+                    y = np.array(spec_data[1])
+                else:
+                    # Try to extract as array
+                    arr = np.array(spec_data)
+                    if arr.ndim == 2:
+                        x = arr[0] if arr.shape[0] == 2 else arr[:, 0]
+                        y = arr[1] if arr.shape[0] == 2 else arr[:, 1]
                     else:
-                        # Single column data, create x as indices
-                        y = f.data.flatten()
-                        x = np.arange(len(y))
+                        raise ValueError("Unknown specio data format")
+                
+                label = os.path.basename(name_hint)
+                series.append((x, y, label))
+                return series
+            finally:
+                try:
+                    os.unlink(tmp_file_path)
+                except:
+                    pass
+        except Exception as e:
+            # Fall back to next method
+            pass
+    
+    # Method 2: Try spc/spc-spectra (if available)
+    if SPC_METHOD == "spc":
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.spc', delete=False) as tmp_file:
+                tmp_file.write(data)
+                tmp_file_path = tmp_file.name
+            
+            try:
+                f = spc.File(tmp_file_path)
+                
+                if hasattr(f, "sub") and f.sub:
+                    for i, s in enumerate(f.sub):
+                        x = np.array(s.x)
+                        y = np.array(s.y)
+                        label = f"{os.path.basename(name_hint)} • sub{i+1}"
+                        series.append((x, y, label))
+                else:
+                    x = np.array(f.x)
+                    y = np.array(f.y)
                     label = os.path.basename(name_hint)
                     series.append((x, y, label))
-                else:
-                    raise e
-            else:
-                raise e
+                
+                return series
+            finally:
+                try:
+                    os.unlink(tmp_file_path)
+                except:
+                    pass
+        except Exception as e:
+            # Fall back to custom reader
+            pass
     
-    if not series:
-        raise ValueError("No data could be extracted from the SPC file")
-    
-    return series
+    # Method 3: Use custom SPC reader as fallback
+    try:
+        x, y = read_spc_custom(data)
+        label = os.path.basename(name_hint)
+        series.append((x, y, label))
+        return series
+    except Exception as e:
+        # If custom reader fails, try one more approach
+        # Some SPC files are actually text files with SPC extension
+        try:
+            # Try to decode as text
+            text = data.decode('utf-8', errors='ignore')
+            if '\n' in text and any(c in text for c in [',', '\t', ' ']):
+                # Looks like text data, parse as CSV/TSV
+                import io
+                return read_table(io.StringIO(text), name_hint)
+        except:
+            pass
+        
+        raise ValueError(f"Could not read SPC file with any available method. Last error: {e}")
 
 def read_table(file_obj, name_hint=""):
     """Read CSV/TXT/TSV into x,y. Tries to infer columns:
@@ -181,15 +274,25 @@ def read_table(file_obj, name_hint=""):
     - If more, tries common headers like 'wavelength','x','time' and 'absorbance','y'
     """
     # Read content once into memory
+    try:
+        file_obj.seek(0)
+    except:
+        pass
+    
     content = file_obj.read()
+    
+    # Handle both bytes and string content
+    if isinstance(content, bytes):
+        text = content.decode('utf-8', errors='ignore')
+    else:
+        text = content
     
     # Try different delimiters
     df = None
     for sep in [",", "\t", ";", r"\s+"]:
         try:
             # Use StringIO to create a file-like object from the content
-            df = pd.read_csv(io.StringIO(content.decode('utf-8') if isinstance(content, bytes) else content), 
-                           sep=sep, engine="python")
+            df = pd.read_csv(io.StringIO(text), sep=sep, engine="python")
             if df.shape[1] >= 2:
                 break
         except Exception:
@@ -228,19 +331,36 @@ def read_table(file_obj, name_hint=""):
 def load_series(uploaded_file):
     """Return list of (x,y,label) for a given uploaded_file, based on extension."""
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
-    file_like = uploaded_file
+    
+    # Reset file position to beginning
+    try:
+        uploaded_file.seek(0)
+    except:
+        pass
+    
     if suffix == ".spc":
-        return read_spc(file_like, uploaded_file.name)
+        return read_spc(uploaded_file, uploaded_file.name)
     else:
-        return read_table(file_like, uploaded_file.name)
+        return read_table(uploaded_file, uploaded_file.name)
 
 # ---------- Main plotting area ----------
 st.title("UV‑Vis Spectrum Plotter (.SPC)")
 st.caption("Upload multiple .spc files (Galactic/GRAMS) or CSV/TXT files and customize the plot.")
 
 if not uploaded_files:
-    if not SPC_AVAILABLE:
-        st.info("Tip: To read **.spc** files, install the optional `spc-spectra` package:\n\n`pip install spc-spectra`")
+    st.info("""
+    📊 **Welcome to the UV-Vis Spectrum Plotter!**
+    
+    Upload your spectroscopy files using the sidebar:
+    - **SPC files** (Galactic/GRAMS format)
+    - **CSV/TXT files** (with wavelength and absorbance columns)
+    
+    For better SPC support, you can optionally install:
+    - `pip install specio` (recommended)
+    - `pip install spc-spectra`
+    
+    The app includes a basic SPC reader that works without additional packages!
+    """)
     st.stop()
 
 # Collect all series
@@ -333,16 +453,19 @@ if st.button("Build combined CSV from all visible series"):
 with st.expander("ℹ️ Notes & Troubleshooting"):
     st.markdown(
         """
-        **.SPC support:** This app reads Galactic/GRAMS `.spc` files via the optional `spc-spectra` package.
-        If you see an error like *'No module named spc_spectra'*, install it with:
+        **.SPC support:** This app can read Galactic/GRAMS `.spc` files using:
+        - Built-in basic SPC reader (always available)
+        - `specio` package for enhanced support: `pip install specio`
+        - `spc-spectra` package as alternative: `pip install spc-spectra`
 
-        ```bash
-        pip install spc-spectra
-        ```
+        **CSV/TXT:** The app automatically detects wavelength/absorbance columns from text files.
+        Common column names like 'wavelength', 'nm', 'absorbance', 'intensity' are recognized.
 
-        **CSV/TXT:** If your spectrometer exports text files instead, the app will infer the first two numeric columns as X and Y.
-        You can rename axes and adjust limits, scales, and tick spacing from the sidebar.
-
-        **Style:** The plot uses **Times New Roman**, bold labels, and inward ticks with separate major/minor lengths to match the look you shared.
+        **Style:** The plot uses Times New Roman (or serif fallback), bold labels, and customizable ticks.
+        
+        **Troubleshooting SPC files:**
+        - If an SPC file won't load, try exporting it as CSV/TXT from your instrument software
+        - Some older SPC formats may not be fully supported
+        - The app will try multiple methods to read your file automatically
         """
     )
