@@ -12,8 +12,8 @@ pandas>=1.5.0
 matplotlib>=3.6.0
 
 # Optional: For enhanced SPC file support (uncomment if needed)
-# specio>=0.2.0
-# spc-spectra>=0.3.0
+specio>=0.2.0
+spc-spectra>=0.3.0
 
 # Note: The dashboard includes a basic SPC reader that works without
 # the optional packages. Install specio or spc-spectra only if you
