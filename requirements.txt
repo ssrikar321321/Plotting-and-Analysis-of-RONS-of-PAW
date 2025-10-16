@@ -1,5 +1,5 @@
-streamlit
-matplotlib
-numpy
-pandas
-spc
+matplotlib==3.8.4
+numpy==1.26.4
+pandas==2.2.2
+spc==0.6
+
