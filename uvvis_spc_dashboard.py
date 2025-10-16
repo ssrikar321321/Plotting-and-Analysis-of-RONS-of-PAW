@@ -1,10 +1,13 @@
-
 # uvvis_spc_dashboard.py
 # Streamlit dashboard for plotting UV‑Vis spectra from .spc files (and CSV/TXT fallback)
+# Author: ChatGPT (GPT-5 Thinking)
+# Requirements: streamlit, matplotlib, numpy, pandas, (optional) spc-spectra
+# If your files are .spc (Galactic/GRAMS), please:  pip install spc-spectra
 
 import io
 import os
 import sys
+import tempfile
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -14,7 +17,11 @@ import matplotlib.ticker as ticker
 # Try to import the 'spc' package for Galactic .spc files.
 # If unavailable, we'll show a help box.
 try:
-    import spc
+    # Try modern spc-spectra first, then fall back to old spc
+    try:
+        import spc_spectra as spc
+    except ImportError:
+        import spc
     SPC_AVAILABLE = True
 except Exception:
     SPC_AVAILABLE = False
@@ -80,67 +87,138 @@ show_legend = st.sidebar.checkbox("Show legend", value=True)
 
 # ---------- Helper functions ----------
 def read_spc(file_obj, name_hint=""):
-    \"\"\"Read a .spc file using the 'spc' package.
+    """Read a .spc file using the 'spc-spectra' package.
     Returns a list of (x, y, label) tuples.
     Handles multi-subfile SPCs.
-    \"\"\"
+    """
+    import tempfile
+    
     if not SPC_AVAILABLE:
-        raise RuntimeError("The 'spc' package is not installed. Run: pip install spc")
-    # spc.File may accept a path or a file-like object. We use bytes.
+        raise RuntimeError("The 'spc-spectra' package is not installed. Run: pip install spc-spectra")
+    
+    # Read the file data
     data = file_obj.read()
-    f = spc.File(io.BytesIO(data))
-
+    
+    # Try different methods to read the SPC file
+    f = None
+    
+    # Method 1: Try direct bytes (some versions might support this)
+    try:
+        f = spc.File(data)
+    except:
+        pass
+    
+    # Method 2: Try BytesIO
+    if f is None:
+        try:
+            f = spc.File(io.BytesIO(data))
+        except:
+            pass
+    
+    # Method 3: Use temporary file (most reliable)
+    if f is None:
+        with tempfile.NamedTemporaryFile(suffix='.spc', delete=False) as tmp_file:
+            tmp_file.write(data)
+            tmp_file_path = tmp_file.name
+        
+        try:
+            f = spc.File(tmp_file_path)
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(tmp_file_path)
+            except:
+                pass
+    
+    if f is None:
+        raise ValueError("Could not read SPC file with any method")
+    
     series = []
     # 'sub' contains individual spectra (subfiles). If absent, data is in f.x/f.y
     if hasattr(f, "sub") and f.sub:
         for i, s in enumerate(f.sub):
-            x = np.array(s.x)
-            y = np.array(s.y)
-            label = f\"{os.path.basename(name_hint)} • sub{i+1}\"
-            series.append((x, y, label))
+            try:
+                x = np.array(s.x)
+                y = np.array(s.y)
+                label = f"{os.path.basename(name_hint)} • sub{i+1}"
+                series.append((x, y, label))
+            except Exception as e:
+                st.warning(f"Could not read subfile {i+1} from {name_hint}: {e}")
     else:
-        x = np.array(f.x)
-        y = np.array(f.y)
-        label = os.path.basename(name_hint)
-        series.append((x, y, label))
+        try:
+            x = np.array(f.x)
+            y = np.array(f.y)
+            label = os.path.basename(name_hint)
+            series.append((x, y, label))
+        except Exception as e:
+            # Some SPC files might have data in different attributes
+            if hasattr(f, 'data'):
+                # Try to extract x and y from data attribute
+                if isinstance(f.data, np.ndarray):
+                    # Assume first column is x, second is y
+                    if f.data.ndim == 2 and f.data.shape[1] >= 2:
+                        x = f.data[:, 0]
+                        y = f.data[:, 1]
+                    else:
+                        # Single column data, create x as indices
+                        y = f.data.flatten()
+                        x = np.arange(len(y))
+                    label = os.path.basename(name_hint)
+                    series.append((x, y, label))
+                else:
+                    raise e
+            else:
+                raise e
+    
+    if not series:
+        raise ValueError("No data could be extracted from the SPC file")
+    
     return series
 
 def read_table(file_obj, name_hint=""):
-    \"\"\"Read CSV/TXT/TSV into x,y. Tries to infer columns:
+    """Read CSV/TXT/TSV into x,y. Tries to infer columns:
     - If two columns: x,y
     - If more, tries common headers like 'wavelength','x','time' and 'absorbance','y'
-    \"\"\"
-    # Try to sniff delimiter
+    """
+    # Read content once into memory
     content = file_obj.read()
-    # Reset for pandas after reading to sniff
-    file_obj.seek(0)
-    # Try common delimiters
-    for sep in [",", "\t", ";", r\"\\s+\"]:
+    
+    # Try different delimiters
+    df = None
+    for sep in [",", "\t", ";", r"\s+"]:
         try:
-            df = pd.read_csv(file_obj, sep=sep, engine="python")
+            # Use StringIO to create a file-like object from the content
+            df = pd.read_csv(io.StringIO(content.decode('utf-8') if isinstance(content, bytes) else content), 
+                           sep=sep, engine="python")
             if df.shape[1] >= 2:
                 break
         except Exception:
-            file_obj.seek(0)
             continue
-    file_obj.seek(0)
-    df = pd.read_csv(file_obj, sep=sep, engine="python")
+    
+    # If no valid dataframe was created, raise an error
+    if df is None or df.shape[1] < 2:
+        raise ValueError(f"Could not parse {name_hint} as a valid data file")
 
-    # Try to identify x/y
+    # Try to identify x/y columns
     cols = [c.lower() for c in df.columns]
     x_idx = None
     y_idx = None
-    # Heuristics
-    for k in ["x","wavelength","time","lambda","nm","minute","min"]:
+    
+    # Heuristics for x column
+    for k in ["x", "wavelength", "time", "lambda", "nm", "minute", "min"]:
         if k in cols and x_idx is None:
             x_idx = cols.index(k)
-    for k in ["y","absorbance","intensity","a.u.","au","signal"]:
+    
+    # Heuristics for y column
+    for k in ["y", "absorbance", "intensity", "a.u.", "au", "signal"]:
         if k in cols and y_idx is None:
             y_idx = cols.index(k)
 
     # Fallback to first two columns
-    if x_idx is None: x_idx = 0
-    if y_idx is None: y_idx = 1
+    if x_idx is None: 
+        x_idx = 0
+    if y_idx is None: 
+        y_idx = 1
 
     x = pd.to_numeric(df.iloc[:, x_idx], errors="coerce").to_numpy()
     y = pd.to_numeric(df.iloc[:, y_idx], errors="coerce").to_numpy()
@@ -148,7 +226,7 @@ def read_table(file_obj, name_hint=""):
     return [(x[mask], y[mask], os.path.basename(name_hint))]
 
 def load_series(uploaded_file):
-    \"\"\"Return list of (x,y,label) for a given uploaded_file, based on extension.\"\"\"
+    """Return list of (x,y,label) for a given uploaded_file, based on extension."""
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
     file_like = uploaded_file
     if suffix == ".spc":
@@ -162,7 +240,7 @@ st.caption("Upload multiple .spc files (Galactic/GRAMS) or CSV/TXT files and cus
 
 if not uploaded_files:
     if not SPC_AVAILABLE:
-        st.info("Tip: To read **.spc** files, install the optional `spc` package:\n\n`pip install spc`")
+        st.info("Tip: To read **.spc** files, install the optional `spc-spectra` package:\n\n`pip install spc-spectra`")
     st.stop()
 
 # Collect all series
@@ -172,7 +250,7 @@ for uf in uploaded_files:
         series = load_series(uf)
         all_series.extend(series)
     except Exception as e:
-        st.warning(f\"Could not read {uf.name}: {e}\")
+        st.warning(f"Could not read {uf.name}: {e}")
 
 if not all_series:
     st.error("No readable data found in the uploaded files.")
@@ -180,8 +258,11 @@ if not all_series:
 
 # ---------- Matplotlib style to match provided code ----------
 plt.rcParams.clear()
+
+# Use a fallback font list in case Times New Roman is not available
+font_list = ["Times New Roman", "DejaVu Serif", "serif"]
 plt.rcParams.update({
-    "font.family": "Times New Roman",
+    "font.family": font_list,
     "font.size": font_size,
     "font.weight": "bold",
     "axes.labelweight": "bold",
@@ -204,17 +285,20 @@ ax.set_yscale(y_scale)
 ax.set_xlim(x_min, x_max)
 ax.set_ylim(y_min, y_max)
 
-# Major/minor locators
-try:
-    ax.xaxis.set_major_locator(ticker.MultipleLocator(x_major))
-    ax.xaxis.set_minor_locator(ticker.MultipleLocator(x_minor))
-except Exception:
-    pass
-try:
-    ax.yaxis.set_major_locator(ticker.MultipleLocator(y_major))
-    ax.yaxis.set_minor_locator(ticker.MultipleLocator(y_minor))
-except Exception:
-    pass
+# Major/minor locators (only apply for linear scale)
+if x_scale == "linear":
+    try:
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(x_major))
+        ax.xaxis.set_minor_locator(ticker.MultipleLocator(x_minor))
+    except Exception:
+        pass
+
+if y_scale == "linear":
+    try:
+        ax.yaxis.set_major_locator(ticker.MultipleLocator(y_major))
+        ax.yaxis.set_minor_locator(ticker.MultipleLocator(y_minor))
+    except Exception:
+        pass
 
 # Labels
 ax.set_xlabel(x_label)
@@ -248,16 +332,17 @@ if st.button("Build combined CSV from all visible series"):
 # ---------- Footer help ----------
 with st.expander("ℹ️ Notes & Troubleshooting"):
     st.markdown(
-        \"\"\"
-        **.SPC support:** This app reads Galactic/GRAMS `.spc` files via the optional `spc` package.
-        If you see an error like *'No module named spc'*, install it with:
+        """
+        **.SPC support:** This app reads Galactic/GRAMS `.spc` files via the optional `spc-spectra` package.
+        If you see an error like *'No module named spc_spectra'*, install it with:
 
         ```bash
-        pip install spc
+        pip install spc-spectra
         ```
 
         **CSV/TXT:** If your spectrometer exports text files instead, the app will infer the first two numeric columns as X and Y.
         You can rename axes and adjust limits, scales, and tick spacing from the sidebar.
 
         **Style:** The plot uses **Times New Roman**, bold labels, and inward ticks with separate major/minor lengths to match the look you shared.
-        \"\"\")
+        """
+    )
