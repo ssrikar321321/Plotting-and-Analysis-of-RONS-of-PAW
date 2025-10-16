@@ -1,9 +1,6 @@
 
 # uvvis_spc_dashboard.py
 # Streamlit dashboard for plotting UV‑Vis spectra from .spc files (and CSV/TXT fallback)
-# Author: ChatGPT (GPT-5 Thinking)
-# Requirements: streamlit, matplotlib, numpy, pandas, (optional) spc
-# If your files are .spc (Galactic/GRAMS), please:  pip install spc
 
 import io
 import os
