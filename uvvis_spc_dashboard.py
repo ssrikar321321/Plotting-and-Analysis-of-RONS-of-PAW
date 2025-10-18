@@ -1,249 +1,349 @@
-#!/usr/bin/env python3
-"""
-Interactive Shimadzu SPC to CSV Converter
-Allows you to verify and correct wavelength ranges
-"""
-
-import streamlit as st
+# app.py
+import io
 import numpy as np
 import pandas as pd
-import olefile
+import streamlit as st
 import matplotlib.pyplot as plt
-import tempfile
-import os
 
-st.set_page_config(page_title="Shimadzu SPC Converter", layout="wide")
-st.title("🔬 Shimadzu SPC to CSV Converter")
-st.caption("Extract correct wavelength and absorbance data from OLE-format SPC files")
+# ----------------------- Page config -----------------------
+st.set_page_config(page_title="In-situ UV/Vis – NO₂⁻ / NO₃⁻ Analyzer",
+                   layout="wide",
+                   initial_sidebar_state="expanded")
 
-# File upload
-uploaded_file = st.file_uploader("Upload Shimadzu .spc file", type=['spc'])
+# ----------------------- Utils -----------------------
+def _split_excel_spectra(df_raw: pd.DataFrame):
+    """
+    Parse an Excel sheet that has some metadata rows followed by a header row
+    whose first cell starts with 'Wavelength'. Returns dict:
+      {sample_name: DataFrame(columns=['wavelength','absorbance'])}
+    """
+    header_row_idx = None
+    for i in range(min(80, len(df_raw))):
+        cell = str(df_raw.iloc[i, 0]).strip().lower()
+        if cell.startswith("wavelength"):
+            header_row_idx = i
+            break
+    if header_row_idx is None:
+        raise ValueError("Couldn't find a 'Wavelength [nm]' header row in this Excel file.")
 
-if uploaded_file:
-    # Read file
-    data = uploaded_file.read()
-    
-    # Save to temp file (olefile needs path)
-    with tempfile.NamedTemporaryFile(suffix='.spc', delete=False) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-    
-    try:
-        ole = olefile.OleFileIO(tmp_path)
-        
-        st.success(f"✅ Opened OLE file: {uploaded_file.name}")
-        
-        # Find all float arrays
-        all_arrays = []
-        
-        with st.expander("📁 OLE Structure Analysis"):
-            for stream_path in ole.listdir():
-                stream_name = '/'.join(stream_path)
-                stream_data = ole.openstream(stream_path).read()
-                
-                st.write(f"**Stream:** {stream_name} ({len(stream_data)} bytes)")
-                
-                # Try to extract float arrays
-                for offset in [0, 32, 64, 128, 256, 512]:
-                    if len(stream_data) > offset:
-                        remaining = stream_data[offset:]
-                        
-                        if len(remaining) % 4 == 0:
-                            try:
-                                arr = np.frombuffer(remaining, dtype='<f4')
-                                if arr.size > 10 and np.all(np.isfinite(arr[:10])):
-                                    all_arrays.append({
-                                        'name': f"{stream_name}_offset{offset}",
-                                        'data': arr,
-                                        'min': arr.min(),
-                                        'max': arr.max(),
-                                        'size': arr.size,
-                                        'is_monotonic': np.all(np.diff(arr) >= 0)
-                                    })
-                                    st.write(f"  - Found array at offset {offset}: "
-                                           f"{arr.size} points, range [{arr.min():.2f}, {arr.max():.2f}]")
-                            except:
-                                pass
-        
-        ole.close()
-        os.unlink(tmp_path)
-        
-        if all_arrays:
-            st.header("🔍 Data Selection")
-            
-            # Identify likely candidates
-            wavelength_candidates = [a for a in all_arrays 
-                                    if a['is_monotonic'] and 100 < a['min'] < 400 and a['max'] > 400]
-            absorbance_candidates = [a for a in all_arrays 
-                                    if -1 < a['min'] < 2 and a['max'] < 10]
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Wavelength Data")
-                
-                if wavelength_candidates:
-                    st.info(f"Found {len(wavelength_candidates)} potential wavelength array(s)")
-                    wl_options = {f"Array {i+1}: {c['size']} points, [{c['min']:.1f}-{c['max']:.1f}]": i 
-                                for i, c in enumerate(wavelength_candidates)}
-                    wl_choice = st.selectbox("Select wavelength array:", 
-                                            options=list(wl_options.keys()))
-                    wavelength_array = wavelength_candidates[wl_options[wl_choice]]['data']
-                else:
-                    st.warning("No wavelength array found. Will generate based on your input.")
-                    wavelength_array = None
-                
-                # Manual wavelength input
-                st.markdown("**Or specify wavelength range manually:**")
-                wcol1, wcol2, wcol3 = st.columns(3)
-                with wcol1:
-                    start_wl = st.number_input("Start (nm)", value=200.0, step=10.0)
-                with wcol2:
-                    end_wl = st.number_input("End (nm)", value=800.0, step=10.0)
-                with wcol3:
-                    use_manual = st.checkbox("Use manual range", value=(wavelength_array is None))
-            
-            with col2:
-                st.subheader("Absorbance Data")
-                
-                if absorbance_candidates:
-                    st.info(f"Found {len(absorbance_candidates)} potential absorbance array(s)")
-                    abs_options = {f"Array {i+1}: {c['size']} points, [{c['min']:.4f}-{c['max']:.4f}]": i 
-                                 for i, c in enumerate(absorbance_candidates)}
-                    abs_choice = st.selectbox("Select absorbance array:", 
-                                             options=list(abs_options.keys()))
-                    absorbance_array = absorbance_candidates[abs_options[abs_choice]]['data']
-                else:
-                    # Try to find any array that's not wavelength
-                    other_arrays = [a for a in all_arrays if not a['is_monotonic']]
-                    if other_arrays:
-                        abs_options = {f"{a['name']}: {a['size']} points": i 
-                                     for i, a in enumerate(other_arrays)}
-                        abs_choice = st.selectbox("Select data array:", 
-                                                 options=list(abs_options.keys()))
-                        absorbance_array = other_arrays[abs_options[abs_choice]]['data']
-                    else:
-                        st.error("No absorbance data found!")
-                        absorbance_array = None
-            
-            # Process and preview
-            if absorbance_array is not None:
-                # Determine wavelengths
-                n_points = len(absorbance_array)
-                
-                if use_manual or wavelength_array is None:
-                    wavelengths = np.linspace(start_wl, end_wl, n_points)
-                    st.info(f"📏 Using manual wavelength range: {start_wl}-{end_wl} nm for {n_points} points")
-                else:
-                    wavelengths = wavelength_array
-                    
-                    # Check if sizes match
-                    if len(wavelengths) != len(absorbance_array):
-                        st.warning(f"⚠️ Size mismatch! Wavelength: {len(wavelengths)}, Absorbance: {len(absorbance_array)}")
-                        st.info("Generating wavelength array to match absorbance data...")
-                        wavelengths = np.linspace(start_wl, end_wl, n_points)
-                
-                # Create dataframe
-                df = pd.DataFrame({
-                    'wavelength_nm': wavelengths,
-                    'absorbance': absorbance_array
-                })
-                
-                # Preview plot
-                st.header("📊 Data Preview")
-                
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-                
-                # Full spectrum
-                ax1.plot(df['wavelength_nm'], df['absorbance'], 'b-', linewidth=1)
-                ax1.set_xlabel('Wavelength (nm)')
-                ax1.set_ylabel('Absorbance')
-                ax1.set_title('Full Spectrum')
-                ax1.grid(True, alpha=0.3)
-                
-                # Zoomed view (first 100 points)
-                n_zoom = min(100, len(df))
-                ax2.plot(df['wavelength_nm'][:n_zoom], df['absorbance'][:n_zoom], 'r.-', linewidth=1, markersize=2)
-                ax2.set_xlabel('Wavelength (nm)')
-                ax2.set_ylabel('Absorbance')
-                ax2.set_title(f'Zoom (first {n_zoom} points)')
-                ax2.grid(True, alpha=0.3)
-                
-                st.pyplot(fig)
-                
-                # Data statistics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Data points", len(df))
-                with col2:
-                    st.metric("λ range (nm)", f"{df['wavelength_nm'].min():.1f} - {df['wavelength_nm'].max():.1f}")
-                with col3:
-                    st.metric("Abs range", f"{df['absorbance'].min():.4f} - {df['absorbance'].max():.4f}")
-                with col4:
-                    interval = np.diff(df['wavelength_nm']).mean()
-                    st.metric("λ interval", f"{interval:.2f} nm")
-                
-                # Export
-                st.header("💾 Export")
-                
-                # Show first few rows
-                st.subheader("Data preview (first 10 rows):")
-                st.dataframe(df.head(10))
-                
-                # Download button
-                csv = df.to_csv(index=False)
-                filename = uploaded_file.name.replace('.spc', '_converted.csv')
-                
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=csv,
-                    file_name=filename,
-                    mime="text/csv"
-                )
-                
-                # Show instructions for verification
-                with st.expander("✅ How to verify the wavelength is correct"):
-                    st.markdown("""
-                    1. **Check the wavelength range**: Does it match your instrument settings?
-                    2. **Look for characteristic peaks**: 
-                       - UV absorbers typically peak around 200-400 nm
-                       - Visible dyes peak at their characteristic colors
-                    3. **Compare with known samples**: If you have a standard, check if peaks align
-                    4. **Check the interval**: Most UV-Vis uses 0.5, 1, or 2 nm intervals
-                    
-                    If the wavelength seems wrong, try:
-                    - Using the manual wavelength range input
-                    - Selecting a different array from the dropdown
-                    - Checking your instrument's method settings for the actual scan range
-                    """)
+    table = df_raw.iloc[header_row_idx:].copy()
+    table.columns = table.iloc[0]
+    table = table.iloc[1:]
+    wl_col = [c for c in table.columns if str(c).lower().startswith("wavelength")][0]
+    table = table.rename(columns={wl_col: "wavelength"})
+
+    # numeric coercion
+    table["wavelength"] = pd.to_numeric(table["wavelength"], errors="coerce")
+    for c in table.columns:
+        if c == "wavelength":
+            continue
+        table[c] = pd.to_numeric(table[c], errors="coerce")
+    table = table.dropna(subset=["wavelength"])
+
+    spectra = {}
+    for c in table.columns:
+        if c == "wavelength":
+            continue
+        df = table[["wavelength", c]].dropna().rename(columns={c: "absorbance"})
+        if df["absorbance"].notna().sum() == 0:
+            continue
+        spectra[str(c)] = df.sort_values("wavelength")
+    if not spectra:
+        raise ValueError("No sample columns with numeric absorbance were found.")
+    return spectra
+
+
+def read_spectrum_file(file):
+    """
+    Wrapper that supports:
+      - Excel (.xlsx/.xls) with metadata block + 'Wavelength [nm]' header row
+      - CSV/TSV with (wavelength, absorbance) columns
+    Returns dict {sample_name: df(wavelength, absorbance)}.
+    """
+    name = file.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        df_raw = pd.read_excel(file, header=None)
+        return _split_excel_spectra(df_raw)
+    else:
+        # CSV/TSV
+        content = file.read()
+        try:
+            df = pd.read_csv(io.BytesIO(content))
+        except Exception:
+            df = pd.read_csv(io.BytesIO(content), sep=r"\s+|;|\t|,", engine="python")
+        cols = [c.lower() for c in df.columns]
+        w_candidates = [i for i, c in enumerate(cols) if "wav" in c or "nm" in c]
+        a_candidates = [i for i, c in enumerate(cols) if "abs" in c or "od" in c or "a.u" in c]
+        if not w_candidates or not a_candidates:
+            w_idx, a_idx = 0, 1
         else:
-            st.error("Could not find any data arrays in this OLE file.")
-            
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-        os.unlink(tmp_path)
+            w_idx, a_idx = w_candidates[0], a_candidates[0]
+        out = df.iloc[:, [w_idx, a_idx]].copy()
+        out.columns = ["wavelength", "absorbance"]
+        out = out.dropna().sort_values("wavelength")
+        return {file.name: out}
+
+
+def window_slice(df, wl_min, wl_max):
+    return df[(df["wavelength"] >= wl_min) & (df["wavelength"] <= wl_max)].copy()
+
+
+def apply_baseline(df):
+    """Linear baseline across the current window."""
+    if len(df) < 2:
+        return df
+    x = df["wavelength"].values
+    y = df["absorbance"].values
+    p = np.polyfit([x[0], x[-1]], [y[0], y[-1]], 1)
+    df = df.copy()
+    df["absorbance"] = y - (p[0] * x + p[1])
+    return df
+
+
+def resample_common_grid(dfs, wl_min, wl_max, step):
+    """Interpolate all spectra to a common wavelength grid; returns (wl_grid, A)."""
+    wl_grid = np.arange(wl_min, wl_max + 1e-12, step)
+    mats = []
+    for df in dfs:
+        d = df.set_index("wavelength")["absorbance"].sort_index()
+        d = d.reindex(wl_grid, method=None)
+        d = d.interpolate(limit_direction="both")
+        mats.append(d.values)
+    A = np.vstack(mats).T  # shape: i x m
+    return wl_grid, A
+
+
+def derivative_spectrum(y, x):
+    """First derivative dA/dλ using central gradient."""
+    return np.gradient(y, x)
+
+
+# ----------------------- Sidebar: acquisition & preprocessing -----------------------
+st.sidebar.header("Acquisition / Preprocessing")
+
+# Informational (path length is constant for standards & unknowns)
+st.sidebar.number_input("Cuvette path length L (cm) – informational", value=1.0, step=0.1)
+
+# Recommended window from the method
+wl_min = st.sidebar.number_input("Wavelength min (nm)", value=227.1, step=0.1, format="%.1f")
+wl_max = st.sidebar.number_input("Wavelength max (nm)", value=233.9, step=0.1, format="%.1f")
+step = st.sidebar.selectbox("Interpolation step (nm)", [0.1, 0.2, 0.5, 1.0], index=2)
+
+baseline_on = st.sidebar.checkbox("Linear baseline correction (per spectrum)", value=True)
+
+use_savgol = st.sidebar.checkbox("Savgitzky–Golay smoothing", value=False)
+if use_savgol:
+    from scipy.signal import savgol_filter
+    sg_win = st.sidebar.slider("Savgol window (odd)", 5, 51, 11, step=2)
+    sg_poly = st.sidebar.slider("Savgol polyorder", 2, 5, 3)
+
+use_derivative = st.sidebar.checkbox("Use first derivative (dA/dλ) for calibration & prediction", value=False,
+                                     help="Enable only if overlapping bands or sloping baselines degrade the fit.")
+
+# ----------------------- Demo calibration option -----------------------
+st.sidebar.markdown("### Demo calibration (no standards)")
+use_demo_K = st.sidebar.toggle("Use demo K (semi-quantitative)", value=False,
+                               help="Synthesizes a K(λ) with tail-like shapes so you can run without standards.")
+demo_params = {}
+if use_demo_K:
+    st.sidebar.caption("Adjust shapes to roughly mimic your NO₂⁻/NO₃⁻ tails:")
+    demo_params["alpha_NO2"] = st.sidebar.slider("NO₂⁻ tail steepness α (1/nm)", 0.05, 0.60, 0.22, 0.01)
+    demo_params["alpha_NO3"] = st.sidebar.slider("NO₃⁻ tail steepness β (1/nm)", 0.05, 0.60, 0.35, 0.01)
+    demo_params["ratio_NO2_to_NO3"] = st.sidebar.slider("Relative strength NO₂⁻ / NO₃⁻", 0.10, 3.0, 0.8, 0.05)
+    demo_params["scale_K"] = st.sidebar.number_input("Overall K scale", value=1.0, step=0.1)
+
+# Optional absolute scaling (applied after prediction)
+scale_abs = st.sidebar.number_input("Output concentration scale factor", value=1.0, step=0.1,
+                                    help="Multiply predicted concentrations by this factor (leave 1.0 if unknown).")
+
+# ----------------------- Section 1: Build K -----------------------
+st.header("1) Calibration: Build **K(λ)**")
+
+K = None
+wl_grid = None
+
+if use_demo_K:
+    wl_grid = np.arange(wl_min, wl_max + 1e-12, step)
+    lam0 = wl_min
+    k_no2 = np.exp(-demo_params["alpha_NO2"] * (wl_grid - lam0))
+    k_no3 = np.exp(-demo_params["alpha_NO3"] * (wl_grid - lam0))
+    # normalize columns, then set NO2/NO3 relative strength and overall scale
+    k_no2 = k_no2 / np.linalg.norm(k_no2)
+    k_no3 = k_no3 / np.linalg.norm(k_no3)
+    k_no2 = demo_params["ratio_NO2_to_NO3"] * k_no2
+    K = demo_params["scale_K"] * np.column_stack([k_no2, k_no3])
+
+    if use_derivative:
+        # if derivative mode, K must also be derivative of k(λ)
+        dk_no2 = derivative_spectrum(k_no2, wl_grid)
+        dk_no3 = derivative_spectrum(k_no3, wl_grid)
+        K = np.column_stack([dk_no2, dk_no3])
+
+    st.info("Using **Demo K** (no standards). Results are semi-quantitative.")
+    fig = plt.figure()
+    plt.plot(wl_grid, K[:, 0], label="k(NO₂⁻) – demo" + (" (deriv)" if use_derivative else ""))
+    plt.plot(wl_grid, K[:, 1], label="k(NO₃⁻) – demo" + (" (deriv)" if use_derivative else ""))
+    plt.xlabel("wavelength (nm)")
+    plt.ylabel("k(λ) (arb.)")
+    plt.legend()
+    st.pyplot(fig)
+
 else:
-    st.info("""
-    ### 📝 Instructions
-    
-    1. **Upload your Shimadzu .spc file** using the button above
-    2. **Review the detected arrays** - the tool will find potential wavelength and absorbance data
-    3. **Verify or correct the wavelength range** if needed
-    4. **Preview the spectrum** to ensure it looks correct
-    5. **Download the CSV file** with corrected wavelengths
-    
-    ### ⚠️ Common Issues & Solutions
-    
-    **Wrong wavelength range?**
-    - Check your instrument method settings for the actual scan range
-    - Use the manual wavelength input to override detected values
-    - Common ranges: 200-800 nm, 190-1100 nm, 200-600 nm
-    
-    **No wavelength array found?**
-    - Some Shimadzu files only store absorbance data
-    - Enter your scan range manually (check your method settings)
-    
-    **Multiple arrays found?**
-    - Try different combinations until the spectrum looks correct
-    - The largest array is usually the main data
-    """)
+    st.caption("Upload **standard** spectra (Excel/CSV). Excel may contain multiple samples per sheet.")
+    std_files = st.file_uploader("Standard spectra files", type=["xlsx", "xls", "csv", "tsv", "txt"],
+                                 accept_multiple_files=True, key="std_files")
+    if std_files:
+        std_specs = []
+        std_labels = []
+        conc_rows = []
+
+        for f in std_files:
+            spec_dict = read_spectrum_file(f)
+            for sample_name, df in spec_dict.items():
+                label = f"{f.name}:{sample_name}"
+                # preprocess
+                df = window_slice(df, wl_min, wl_max)
+                if baseline_on:
+                    df = apply_baseline(df)
+                if use_savgol and len(df) >= sg_win:
+                    df = df.copy()
+                    df["absorbance"] = savgol_filter(df["absorbance"].values, sg_win, sg_poly)
+                std_specs.append(df)
+                std_labels.append(label)
+
+        with st.expander("Enter concentrations for each standard (µM)"):
+            for label in std_labels:
+                c_no2 = st.number_input(f"[{label}]  NO₂⁻ (µM)", min_value=0.0, value=0.0, step=1.0, key=f"no2_{label}")
+                c_no3 = st.number_input(f"[{label}]  NO₃⁻ (µM)", min_value=0.0, value=0.0, step=1.0, key=f"no3_{label}")
+                conc_rows.append({"label": label, "NO2_uM": c_no2, "NO3_uM": c_no3})
+        C_df = pd.DataFrame(conc_rows).set_index("label")
+
+        # Common grid and A matrix
+        wl_grid, A = resample_common_grid(std_specs, wl_min, wl_max, step)   # i x m
+        # If derivative selected, convert A -> dA/dλ
+        if use_derivative:
+            A = np.apply_along_axis(lambda y: derivative_spectrum(y, wl_grid), 0, A)
+
+        # Build concentration matrix C (n x m), n=2 components
+        C = C_df[["NO2_uM", "NO3_uM"]].to_numpy().T
+        try:
+            K = A @ C.T @ np.linalg.inv(C @ C.T)  # i x n
+            st.success("Computed K from standards.")
+            fig = plt.figure()
+            plt.plot(wl_grid, K[:, 0], label="k(NO₂⁻)" + (" (deriv)" if use_derivative else ""))
+            plt.plot(wl_grid, K[:, 1], label="k(NO₃⁻)" + (" (deriv)" if use_derivative else ""))
+            plt.xlabel("wavelength (nm)")
+            plt.ylabel("k(λ)")
+            plt.legend()
+            st.pyplot(fig)
+        except np.linalg.LinAlgError:
+            st.error("Matrix C·Cᵀ is singular. Provide more varied standards (non-collinear in composition).")
+
+# ----------------------- Section 2: Analyze unknowns -----------------------
+st.header("2) Analyze unknown spectra")
+
+unk_files = st.file_uploader("Unknown spectra files", type=["xlsx", "xls", "csv", "tsv", "txt"],
+                             accept_multiple_files=True, key="unk_files")
+
+if unk_files and K is not None:
+    unk_specs = []
+    labels = []
+
+    for f in unk_files:
+        try:
+            spec_dict = read_spectrum_file(f)
+        except Exception as e:
+            st.error(f"{f.name}: {e}")
+            continue
+
+        for sample_name, df in spec_dict.items():
+            label = f"{f.name}:{sample_name}"
+            df = window_slice(df, wl_min, wl_max)
+            if baseline_on:
+                df = apply_baseline(df)
+            if use_savgol and len(df) >= (sg_win if use_savgol else 5):
+                df = df.copy()
+                df["absorbance"] = savgol_filter(df["absorbance"].values, sg_win, sg_poly)
+            unk_specs.append(df)
+            labels.append(label)
+
+    wl_grid_unk, Aunk = resample_common_grid(unk_specs, wl_min, wl_max, step)
+    if not np.allclose(wl_grid_unk, wl_grid):
+        # Re-interpolate to match K grid if needed
+        wl_grid = wl_grid_unk
+
+    if use_derivative:
+        Aunk = np.apply_along_axis(lambda y: derivative_spectrum(y, wl_grid), 0, Aunk)
+
+    # Pseudoinverse for stability
+    Kpinv = np.linalg.pinv(K)   # shape: (n x i)
+
+    concs = []
+    for j in range(Aunk.shape[1]):     # for each unknown spectrum
+        Acol = Aunk[:, j]
+        c = Kpinv @ Acol               # (2,)
+        concs.append(c)
+    concs = np.array(concs) * scale_abs
+    conc_df = pd.DataFrame(concs, columns=["[NO2-]_uM", "[NO3-]_uM"])
+    conc_df.insert(0, "sample", labels)
+
+    st.subheader("Predicted concentrations (µM)")
+    st.dataframe(conc_df, use_container_width=True)
+
+    # Bar plot
+    fig2 = plt.figure()
+    x = np.arange(len(labels))
+    plt.bar(x - 0.15, conc_df["[NO2-]_uM"], width=0.3, label="NO₂⁻")
+    plt.bar(x + 0.15, conc_df["[NO3-]_uM"], width=0.3, label="NO₃⁻")
+    plt.xticks(x, labels, rotation=45, ha="right")
+    plt.ylabel("Concentration (µM)")
+    plt.legend()
+    st.pyplot(fig2)
+
+    # ---------------- Energy efficiency ----------------
+    st.subheader("3) Energy efficiency η")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        V_mL = st.number_input("Water volume V (mL)", value=3.0, step=0.1)
+    with col2:
+        Pd_W = st.number_input("Discharge power P_d (W)", value=10.0, step=0.1)
+    with col3:
+        add_o3 = st.checkbox("Add 8 W for ozone generator", value=False)
+
+    Pd_eff = Pd_W + (8.0 if add_o3 else 0.0)
+    default_t = st.number_input("Treatment time Δt per sample (s)", value=60.0, step=1.0)
+
+    eta_rows = []
+    for _, row in conc_df.iterrows():
+        NOx_uM = row["[NO2-]_uM"] + row["[NO3-]_uM"]
+        V_L = V_mL / 1000.0
+        eta_umol_per_J = (NOx_uM * V_L) / (Pd_eff * default_t)   # µmol/J
+        eta_nmol_per_J = eta_umol_per_J * 1e3                    # nmol/J
+        eta_rows.append({"sample": row["sample"], "eta (nmol/J)": eta_nmol_per_J})
+    eta_df = pd.DataFrame(eta_rows)
+
+    st.dataframe(eta_df, use_container_width=True)
+    fig3 = plt.figure()
+    plt.plot(eta_df["sample"], eta_df["eta (nmol/J)"], marker="o")
+    plt.ylabel("η (nmol/J)")
+    plt.xticks(rotation=45, ha="right")
+    st.pyplot(fig3)
+
+    # Download
+    out = conc_df.merge(eta_df, on="sample", how="left")
+    st.download_button("⬇️ Download results (CSV)",
+                       out.to_csv(index=False),
+                       file_name="NOx_concentrations_and_eta.csv",
+                       mime="text/csv")
+elif unk_files and K is None:
+    st.warning("Please build K first (use Demo K or upload standards).")
+
+# ----------------------- Method notes -----------------------
+st.divider()
+st.markdown(
+    "**Notes**  \n"
+    "- Default window **227.1–233.9 nm** minimizes pH sensitivity and NO₃⁻ saturation below 210 nm.  \n"
+    "- Keep **baseline correction** enabled unless your blank subtraction is perfect.  \n"
+    "- **First-derivative mode** helps when bands overlap or the baseline drifts; it increases noise, so use with smoothing.  \n"
+    "- The **Demo K** is for workflow testing only; switch to real standards for quantitative work."
+)
